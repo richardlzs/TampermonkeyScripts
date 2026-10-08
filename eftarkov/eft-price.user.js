@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EFTarkov 物价天梯增强 + 官方分类筛选
 // @namespace    https://www.eftarkov.com/
-// @version      3.0.2
-// @description  为 EFTarkov PvE、PvP、PvP Season 物价天梯补充 10,000~49,999 ₽/格档位，并按官方分类筛选
+// @version      3.1.0
+// @description  为 EFTarkov 三种模式补充 10,000~49,999 ₽/格档位，支持官方分类、物品名和跳蚤报价数量筛选
 // @author       Richard
 // @homepageURL  https://github.com/richardlzs/TampermonkeyScripts
 // @updateURL    https://raw.githubusercontent.com/richardlzs/TampermonkeyScripts/main/eftarkov/eft-price.user.js
@@ -58,15 +58,22 @@
     let currentObservedMode = null;
     let originalRangeObservers = [];
     let applyFilterTimer = null;
+    let nameFilterTimer = null;
 
     function createModeState(mode) {
+        const filterState = loadFilterState(mode);
         return {
             mode,
             apiItems: null,
             displayItems: [],
             itemById: new Map(),
             categoryIndex: new Map(),
-            filterState: loadFilterState(mode),
+            filterState,
+            offerRangeDraft: {
+                min: String(filterState.minOfferCount ?? ''),
+                max: String(filterState.maxOfferCount ?? ''),
+                error: ''
+            },
             fallbackTimer: null,
             fetchInFlight: null,
             siteRequestsInFlight: 0,
@@ -76,16 +83,21 @@
         };
     }
 
-    function loadFilterState(mode) {
-        const empty = () => ({
+    function createDefaultFilterState() {
+        return {
             showAll: true,
             selectedTops: new Set(),
-            selectedSubsByTop: new Map()
-        });
+            selectedSubsByTop: new Map(),
+            searchQuery: '',
+            minOfferCount: null,
+            maxOfferCount: null
+        };
+    }
 
+    function loadFilterState(mode) {
         try {
             const saved = JSON.parse(localStorage.getItem(`${FILTER_STORAGE_PREFIX}${mode}`));
-            if (!saved || typeof saved !== 'object') return empty();
+            if (!saved || typeof saved !== 'object') return createDefaultFilterState();
 
             const selectedTops = new Set(
                 Array.isArray(saved.selectedTops)
@@ -101,14 +113,18 @@
                 }
             }
 
+            const range = parseOfferCountRange(saved.minOfferCount, saved.maxOfferCount);
             return {
                 showAll: saved.showAll !== false,
                 selectedTops,
-                selectedSubsByTop
+                selectedSubsByTop,
+                searchQuery: typeof saved.searchQuery === 'string' ? saved.searchQuery.trim() : '',
+                minOfferCount: range.valid ? range.min : null,
+                maxOfferCount: range.valid ? range.max : null
             };
         } catch (error) {
             console.warn(`[EFTarkov 扩展] 无法读取 ${mode} 分类设置:`, error);
-            return empty();
+            return createDefaultFilterState();
         }
     }
 
@@ -122,7 +138,10 @@
                 selectedTops: [...filterState.selectedTops],
                 selectedSubsByTop: Object.fromEntries(
                     [...filterState.selectedSubsByTop].map(([top, subs]) => [top, [...subs]])
-                )
+                ),
+                searchQuery: filterState.searchQuery,
+                minOfferCount: filterState.minOfferCount,
+                maxOfferCount: filterState.maxOfferCount
             }));
         } catch (error) {
             console.warn(`[EFTarkov 扩展] 无法保存 ${mode} 分类设置:`, error);
@@ -306,15 +325,18 @@
         const valuePerSlot = volume > 0 ? highestPrice / volume : 0;
 
         const categoryInfo = getCategoryInfo(item);
+        const offerCount = parseNonNegativeInteger(item.lastOfferCount);
 
         return {
             itemData: item,
             highestPrice,
             valuePerSlot,
             categoryInfo,
+            searchNames: [normalizeSearchText(item.name), normalizeSearchText(item.shortName)],
+            offerCount,
             displayData: {
                 formattedPrice: formatPrice(highestPrice),
-                offerCount: formatPrice(item.lastOfferCount || 0),
+                offerCount: offerCount === null ? '未知' : formatPrice(offerCount),
                 updatedTime: timeSince(new Date(item.updated)),
                 valuePerSlot: Math.round(valuePerSlot)
             }
@@ -338,7 +360,7 @@
         const state = modeStates[mode];
         renderExtraRanges(state);
         renderFilterControls(state);
-        applyCategoryFilter(state);
+        applyFilters(state);
 
         console.log(
             `[EFTarkov 扩展] ${MODE_CONFIG[mode].label} ≥${formatPrice(MIN_VALUE_PER_SLOT)} ₽/格：` +
@@ -595,7 +617,7 @@
     }
 
     // ---------------------------------------------------------------------
-    // 4. 官方分类筛选 UI
+    // 4. 分类、名称与报价数量筛选 UI
     // ---------------------------------------------------------------------
 
     function ensureFilterPanel() {
@@ -611,14 +633,28 @@
         panel.innerHTML = `
             <div class="tm-filter-head">
                 <div>
-                    <strong id="tm-filter-title">物品分类筛选</strong>
-                    <span class="tm-filter-subtitle">（分类来自 API handbookCategories）</span>
+                    <strong id="tm-filter-title">物品筛选</strong>
+                    <span class="tm-filter-subtitle">（分类、名称和数量条件需同时满足）</span>
                 </div>
                 <div class="tm-filter-actions">
-                    <button type="button" data-action="all">全部</button>
-                    <button type="button" data-action="clear">清空</button>
+                    <button type="button" data-action="all">全部分类</button>
+                    <button type="button" data-action="clear">清空分类</button>
+                    <button type="button" data-action="reset">重置所有筛选</button>
                 </div>
             </div>
+            <div class="tm-filter-search-row">
+                <label class="tm-filter-name-label">物品名
+                    <input id="tm-filter-name" type="search" placeholder="名称或简称包含关键词" autocomplete="off">
+                </label>
+                <fieldset class="tm-filter-offer-range">
+                    <legend>跳蚤报价数量</legend>
+                    <input id="tm-filter-offer-min" type="text" inputmode="numeric" pattern="[0-9]*" aria-label="最小报价数量" aria-describedby="tm-filter-range-help tm-filter-input-error" placeholder="最小值" autocomplete="off">
+                    <span>～</span>
+                    <input id="tm-filter-offer-max" type="text" inputmode="numeric" pattern="[0-9]*" aria-label="最大报价数量" aria-describedby="tm-filter-range-help tm-filter-input-error" placeholder="最大值" autocomplete="off">
+                    <span id="tm-filter-range-help" class="tm-filter-muted">留空不限，包含两端</span>
+                </fieldset>
+            </div>
+            <div id="tm-filter-input-error" class="tm-filter-input-error" role="status" aria-live="polite" hidden></div>
             <div id="tm-filter-status" class="tm-filter-status">等待数据…</div>
             <div id="tm-filter-top" class="tm-filter-section"></div>
             <div id="tm-filter-sub" class="tm-filter-section tm-filter-subsection"></div>
@@ -631,6 +667,42 @@
             firstContainer.before(panel);
         }
 
+        panel.querySelector('#tm-filter-name').addEventListener('input', event => {
+            const state = getCurrentState();
+            if (!state) return;
+            state.filterState.searchQuery = event.target.value.trim();
+            saveFilterState(state.mode);
+            clearTimeout(nameFilterTimer);
+            nameFilterTimer = setTimeout(() => {
+                if (getCurrentState() === state) applyFilters(state);
+            }, 120);
+        });
+
+        const minInput = panel.querySelector('#tm-filter-offer-min');
+        const maxInput = panel.querySelector('#tm-filter-offer-max');
+        const applyOfferRange = () => {
+            const state = getCurrentState();
+            if (!state) return;
+            const valid = updateOfferCountRange(state, minInput.value, maxInput.value);
+            renderOfferRangeError(state);
+            if (valid) {
+                saveFilterState(state.mode);
+                applyFilters(state);
+            }
+        };
+        minInput.addEventListener('input', applyOfferRange);
+        maxInput.addEventListener('input', applyOfferRange);
+
+        panel.querySelector('[data-action="reset"]').addEventListener('click', () => {
+            const state = getCurrentState();
+            if (!state) return;
+            clearTimeout(nameFilterTimer);
+            resetFilters(state);
+            saveFilterState(state.mode);
+            renderFilterControls(state);
+            applyFilters(state);
+        });
+
         panel.querySelector('[data-action="all"]').addEventListener('click', () => {
             const mode = getCurrentMode();
             const filterState = modeStates[mode]?.filterState;
@@ -640,7 +712,7 @@
             filterState.selectedSubsByTop.clear();
             saveFilterState(mode);
             renderFilterControls();
-            applyCategoryFilter();
+            applyFilters();
         });
 
         panel.querySelector('[data-action="clear"]').addEventListener('click', () => {
@@ -652,10 +724,42 @@
             filterState.selectedSubsByTop.clear();
             saveFilterState(mode);
             renderFilterControls();
-            applyCategoryFilter();
+            applyFilters();
         });
 
         return true;
+    }
+
+    function resetFilters(state) {
+        state.filterState = createDefaultFilterState();
+        state.offerRangeDraft = { min: '', max: '', error: '' };
+    }
+
+    // 输入草稿留在本模式内；无效范围不会写入已生效条件或持久化设置。
+    function updateOfferCountRange(state, minText, maxText) {
+        const range = parseOfferCountRange(minText, maxText);
+        state.offerRangeDraft = { min: minText, max: maxText, error: range.error };
+        if (!range.valid) return false;
+        state.filterState.minOfferCount = range.min;
+        state.filterState.maxOfferCount = range.max;
+        return true;
+    }
+
+    function renderAdditionalFilterControls(state) {
+        document.getElementById('tm-filter-name').value = state.filterState.searchQuery;
+        document.getElementById('tm-filter-offer-min').value = state.offerRangeDraft.min;
+        document.getElementById('tm-filter-offer-max').value = state.offerRangeDraft.max;
+        renderOfferRangeError(state);
+    }
+
+    function renderOfferRangeError(state) {
+        const error = document.getElementById('tm-filter-input-error');
+        const message = state.offerRangeDraft.error;
+        error.textContent = message ? `${message} 已生效的数量范围保持不变。` : '';
+        error.hidden = !message;
+        for (const id of ['tm-filter-offer-min', 'tm-filter-offer-max']) {
+            document.getElementById(id).setAttribute('aria-invalid', String(Boolean(message)));
+        }
     }
 
     function renderFilterControls(state = getCurrentState()) {
@@ -664,6 +768,7 @@
         const subContainer = document.getElementById('tm-filter-sub');
         if (!state || !panel || !topContainer || !subContainer) return;
 
+        renderAdditionalFilterControls(state);
         const { categoryIndex, filterState } = state;
 
         topContainer.innerHTML = '';
@@ -706,7 +811,7 @@
 
                 saveFilterState(getCurrentMode());
                 renderFilterControls();
-                applyCategoryFilter();
+                applyFilters();
             });
 
             topOptions.appendChild(label);
@@ -748,7 +853,7 @@
                     filterState.selectedSubsByTop.delete(top.key);
                     saveFilterState(getCurrentMode());
                     renderFilterControls();
-                    applyCategoryFilter();
+                    applyFilters();
                 });
                 groupHead.appendChild(resetButton);
                 group.appendChild(groupHead);
@@ -787,7 +892,7 @@
 
                             saveFilterState(getCurrentMode());
                             renderFilterControls();
-                            applyCategoryFilter();
+                            applyFilters();
                         });
 
                         options.appendChild(label);
@@ -855,6 +960,51 @@
         if (changed) saveFilterState(state.mode);
     }
 
+    function normalizeSearchText(value) {
+        return String(value ?? '').trim().toLowerCase();
+    }
+
+    // 不把 null、空文本或异常字段转换成 0；允许 API 返回整数或整数数字串。
+    function parseNonNegativeInteger(value) {
+        if (typeof value !== 'number' && typeof value !== 'string') return null;
+        if (typeof value === 'string' && !/^\d+$/.test(value.trim())) return null;
+        const count = Number(value);
+        return Number.isSafeInteger(count) && count >= 0 ? count : null;
+    }
+
+    function parseOfferCountRange(minValue, maxValue) {
+        const isBlank = value => value === null || value === undefined ||
+            (typeof value === 'string' && value.trim() === '');
+        const min = isBlank(minValue) ? null : parseNonNegativeInteger(minValue);
+        const max = isBlank(maxValue) ? null : parseNonNegativeInteger(maxValue);
+        if ((!isBlank(minValue) && min === null) || (!isBlank(maxValue) && max === null)) {
+            return { valid: false, min: null, max: null, error: '报价数量必须是非负整数。' };
+        }
+        if (min !== null && max !== null && min > max) {
+            return { valid: false, min: null, max: null, error: '最小值不能大于最大值。' };
+        }
+        return { valid: true, min, max, error: '' };
+    }
+
+    function hasActiveFilters(filterState) {
+        return !filterState.showAll || Boolean(normalizeSearchText(filterState.searchQuery)) ||
+            filterState.minOfferCount !== null || filterState.maxOfferCount !== null;
+    }
+
+    // 分类内部按原有规则组合；名称与报价数量再与分类条件取交集。
+    function matchesFilters(item, filterState) {
+        if (!matchesCategoryFilter(item, filterState)) return false;
+        const query = normalizeSearchText(filterState.searchQuery);
+        if (query && !item.searchNames.some(name => name.includes(query))) return false;
+        const { minOfferCount, maxOfferCount } = filterState;
+        if (minOfferCount !== null || maxOfferCount !== null) {
+            if (item.offerCount === null) return false;
+            if (minOfferCount !== null && item.offerCount < minOfferCount) return false;
+            if (maxOfferCount !== null && item.offerCount > maxOfferCount) return false;
+        }
+        return true;
+    }
+
     function matchesCategoryFilter(item, filterState) {
         if (filterState.showAll) return true;
         if (!filterState.selectedTops.size) return false;
@@ -868,7 +1018,7 @@
         return info.descendants.some(name => selectedSubs.has(name));
     }
 
-    function applyCategoryFilter(state = getCurrentState()) {
+    function applyFilters(state = getCurrentState()) {
         if (!state || state.apiItems === null || getCurrentState() !== state) return;
 
         // 原站五档 + 新增四档全部统一筛选。
@@ -901,7 +1051,7 @@
         for (const element of itemElements) {
             const id = getItemIdFromElement(element);
             const item = id ? state.itemById.get(id) : null;
-            const visible = item ? matchesCategoryFilter(item, state.filterState) : state.filterState.showAll;
+            const visible = item ? matchesFilters(item, state.filterState) : !hasActiveFilters(state.filterState);
 
             element.style.display = visible ? '' : 'none';
             if (visible) visibleCount += 1;
@@ -922,11 +1072,11 @@
     function updateFilterEmptyMessage(container, visibleCount, filterState) {
         let message = container.querySelector(':scope > .tm-filter-empty');
 
-        if (visibleCount === 0 && !filterState.showAll) {
+        if (visibleCount === 0 && hasActiveFilters(filterState)) {
             if (!message) {
                 message = document.createElement('div');
                 message.className = 'category-loading tm-filter-empty';
-                message.textContent = '当前分类筛选下无物品';
+                message.textContent = '当前筛选条件下无物品';
                 container.appendChild(message);
             }
         } else if (message) {
@@ -955,7 +1105,7 @@
         if (!status || !state || state.apiItems === null) return;
 
         const { filterState, displayItems } = state;
-        const visible = displayItems.filter(item => matchesCategoryFilter(item, filterState)).length;
+        const visible = displayItems.filter(item => matchesFilters(item, filterState)).length;
         let filterText = '全部官方分类';
 
         if (!filterState.showAll) {
@@ -964,8 +1114,19 @@
                 : '未选择任何分类';
         }
 
+        const conditions = [filterText];
+        if (filterState.searchQuery) conditions.push(`名称包含“${filterState.searchQuery}”`);
+        const { minOfferCount, maxOfferCount } = filterState;
+        if (minOfferCount !== null && maxOfferCount !== null) {
+            conditions.push(`报价数 ${formatPrice(minOfferCount)}～${formatPrice(maxOfferCount)}`);
+        } else if (minOfferCount !== null) {
+            conditions.push(`报价数 ≥ ${formatPrice(minOfferCount)}`);
+        } else if (maxOfferCount !== null) {
+            conditions.push(`报价数 ≤ ${formatPrice(maxOfferCount)}`);
+        }
+
         status.classList.remove('tm-error');
-        status.textContent = `当前显示 ${visible} / ${displayItems.length} 件（单格 ≥ ${formatPrice(MIN_VALUE_PER_SLOT)} ₽）｜${filterText}`;
+        status.textContent = `当前显示 ${visible} / ${displayItems.length} 件（单格 ≥ ${formatPrice(MIN_VALUE_PER_SLOT)} ₽）｜${conditions.join('｜')}`;
     }
 
     function setPanelStatus(text, isError = false) {
@@ -989,6 +1150,7 @@
         if (!force && mode === currentObservedMode) return;
 
         currentObservedMode = mode;
+        clearTimeout(nameFilterTimer);
         const state = modeStates[mode];
 
         const panel = document.getElementById(FILTER_PANEL_ID);
@@ -1003,7 +1165,9 @@
         }
 
         const title = document.getElementById('tm-filter-title');
-        if (title) title.textContent = `${MODE_CONFIG[mode].label} 物品分类筛选`;
+        if (title) title.textContent = `${MODE_CONFIG[mode].label} 物品筛选`;
+
+        renderAdditionalFilterControls(state);
 
         if (state.apiItems !== null) {
             renderModeState(mode);
@@ -1028,7 +1192,7 @@
                 clearTimeout(applyFilterTimer);
                 applyFilterTimer = setTimeout(() => {
                     const state = getCurrentState();
-                    if (state && state.apiItems !== null) applyCategoryFilter(state);
+                    if (state && state.apiItems !== null) applyFilters(state);
                     else restoreOriginalRanges();
                 }, 80);
             });
@@ -1139,11 +1303,60 @@
                 font-size: 12px;
             }
             #${FILTER_PANEL_ID} .tm-filter-actions,
-            #${FILTER_PANEL_ID} .tm-filter-options {
+            #${FILTER_PANEL_ID} .tm-filter-options,
+            #${FILTER_PANEL_ID} .tm-filter-search-row {
                 display: flex;
                 flex-wrap: wrap;
                 gap: 7px 10px;
                 align-items: center;
+            }
+            #${FILTER_PANEL_ID} .tm-filter-name-label {
+                display: flex;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 7px;
+                flex: 1 1 260px;
+            }
+            #${FILTER_PANEL_ID} .tm-filter-name-label input,
+            #${FILTER_PANEL_ID} .tm-filter-offer-range input {
+                box-sizing: border-box;
+                min-width: 0;
+                border: 1px solid rgba(255,255,255,.25);
+                border-radius: 4px;
+                padding: 5px 8px;
+                background: rgba(255,255,255,.07);
+                color: inherit;
+                font: inherit;
+            }
+            #${FILTER_PANEL_ID} .tm-filter-name-label input {
+                flex: 1 1 180px;
+                width: 100%;
+            }
+            #${FILTER_PANEL_ID} .tm-filter-offer-range {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 7px;
+                min-width: 0;
+                padding: 4px 0 0;
+                margin: 0;
+                border: 0;
+            }
+            #${FILTER_PANEL_ID} .tm-filter-offer-range legend {
+                font-size: inherit;
+                padding: 0;
+                margin-bottom: 4px;
+            }
+            #${FILTER_PANEL_ID} .tm-filter-offer-range input {
+                width: 110px;
+            }
+            #${FILTER_PANEL_ID} input[aria-invalid="true"] {
+                border-color: #f29c8d;
+            }
+            #${FILTER_PANEL_ID} .tm-filter-input-error {
+                margin-top: 7px;
+                color: #f29c8d;
+                font-size: 13px;
             }
             #${FILTER_PANEL_ID} button {
                 cursor: pointer;
