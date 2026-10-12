@@ -4,7 +4,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, 'eft-price.user.js'), 'utf8');
-const instrumented = source.replace(/\}\)\(\);\s*$/, 'window.__testHooks = { modeStates, calculateItem, captureApiData, getCurrentMode, createItemHtml, formatPrice, createDefaultFilterState, loadFilterState, saveFilterState, matchesFilters, hasActiveFilters, parseOfferCountRange, updateOfferCountRange, resetFilters };\n})();');
+const instrumented = source.replace(/\}\)\(\);\s*$/, 'window.__testHooks = { modeStates, calculateItem, captureApiData, getCurrentMode, createItemHtml, formatPrice, createDefaultFilterState, loadFilterState, saveFilterState, matchesFilters, hasActiveFilters, parseOfferCountRange, updateOfferCountRange, resetFilters, resolveRankingMode, loadRankingFilterState, saveRankingFilterState, parseRankingOfferCount, readRankingItem, matchesNameAndOfferFilters };\n})();');
 assert.notEqual(instrumented, source, '无法注入测试观察点');
 
 const storage = new Map();
@@ -219,7 +219,67 @@ async function complete(request, items) {
     assert.equal(states.pve.offerRangeDraft.min, '');
     assert.equal(states.pve.offerRangeDraft.error, '');
 
-    console.log('EFTarkov 模式、响应隔离、价格边界、HTML 安全、名称和数量组合筛选及设置兼容检查通过');
+    // 新版使用页面模式和原站卡片字段，不启动旧 API，也不改写原站旧模式设置。
+    for (const href of ['https://www.eftarkov.com/ranking', 'https://www.eftarkov.com/ranking/?mode=pve&category=keys']) {
+        const rankingStorage = new Map();
+        const rankingFetch = () => { throw new Error('新版不应请求旧接口'); };
+        const rankingWindow = { fetch: rankingFetch };
+        vm.runInNewContext(source, {
+            window: rankingWindow, document: { readyState: 'loading', addEventListener() {} },
+            location: { href }, URL,
+            localStorage: {
+                getItem: key => rankingStorage.get(key) ?? null,
+                setItem: (key, value) => rankingStorage.set(key, value)
+            }
+        });
+        assert.equal(rankingWindow.fetch, rankingFetch);
+        assert.equal(rankingStorage.size, 0, '新版入口不得触发旧版 currentMode 初始化');
+    }
+    assert.equal(hooks.resolveRankingMode('https://www.eftarkov.com/ranking?mode=pve', '/ranking?mode=pvp'), 'pve');
+    assert.equal(hooks.resolveRankingMode('https://www.eftarkov.com/ranking', '/ranking?mode=season'), 'season');
+    assert.equal(hooks.resolveRankingMode('https://www.eftarkov.com/ranking?mode=invalid', '/ranking?mode=pvp'), 'pvp');
+    assert.equal(hooks.resolveRankingMode('https://www.eftarkov.com/ranking'), 'pvp');
+    for (const text of [undefined, '', '报价数量：未知', '报价数量：-1', '报价数量：1.5', '报价数量：1e2',
+        '报价数量：12,34', '报价数量：9007199254740992', '24小时最高：1', '报价数量：']) {
+        assert.equal(hooks.parseRankingOfferCount(text), null);
+    }
+    assert.equal(hooks.parseRankingOfferCount(' 报价数量：0 '), 0);
+    assert.equal(hooks.parseRankingOfferCount('报价数量：1,234'), 1234);
+    assert.equal(hooks.parseRankingOfferCount('报价数量: 20'), 20);
+    const rankingElement = {
+        querySelector(selector) {
+            return {
+                '.ranking-tooltip-source > b': { textContent: 'TerraGroup 仓库钥匙卡' },
+                '.ranking-item-name': { textContent: ' 化工厂 ' }
+            }[selector];
+        },
+        querySelectorAll() { return [{ textContent: '当前最低价：4,500,000 ₽' }, { textContent: '报价数量：10' }]; }
+    };
+    const rankingItem = hooks.readRankingItem(rankingElement);
+    const rankingFilters = { searchQuery: '  TERRAGROUP  ', minOfferCount: 10, maxOfferCount: 10 };
+    assert.equal(hooks.matchesNameAndOfferFilters(rankingItem, rankingFilters), true);
+    rankingFilters.searchQuery = '化工';
+    assert.equal(hooks.matchesNameAndOfferFilters(rankingItem, rankingFilters), true, '新版应同时支持完整名称与简称');
+    rankingFilters.maxOfferCount = 9;
+    assert.equal(hooks.matchesNameAndOfferFilters(rankingItem, rankingFilters), false);
+
+    const legacyPveSettings = storage.get('eftarkov-filter-pve');
+    const inherited = hooks.loadRankingFilterState('pve');
+    assert.equal(inherited.searchQuery, 'Salewa');
+    assert.equal(inherited.minOfferCount, 10);
+    assert.equal(Object.hasOwn(inherited, 'selectedTops'), false, '新版不继承旧版分类限制');
+    const newRankingState = { mode: 'pve', filterState: { searchQuery: '钥匙', minOfferCount: 0, maxOfferCount: 5 } };
+    hooks.saveRankingFilterState(newRankingState);
+    assert.equal(storage.get('eftarkov-filter-pve'), legacyPveSettings, '新版保存不得覆盖旧版筛选');
+    assert.equal(hooks.loadRankingFilterState('pve').searchQuery, '钥匙');
+    assert.equal(hooks.loadRankingFilterState('pvp').searchQuery, '');
+    hooks.updateOfferCountRange(newRankingState, '6', '5');
+    hooks.saveRankingFilterState(newRankingState);
+    assert.equal(hooks.loadRankingFilterState('pve').minOfferCount, 0, '新版非法草稿不得覆盖有效设置');
+    storage.set('eftarkov-ranking-filter-season', JSON.stringify({ minOfferCount: 30, maxOfferCount: 20 }));
+    assert.equal(hooks.loadRankingFilterState('season').minOfferCount, null);
+
+    console.log('EFTarkov 新旧版模式、响应隔离、价格边界、HTML 安全、名称/数量筛选和设置兼容检查通过');
 })().catch(error => {
     console.error(error);
     process.exitCode = 1;

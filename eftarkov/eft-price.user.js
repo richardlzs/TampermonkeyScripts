@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         EFTarkov 物价天梯增强 + 官方分类筛选
 // @namespace    https://www.eftarkov.com/
-// @version      3.1.0
-// @description  为 EFTarkov 三种模式补充 10,000~49,999 ₽/格档位，支持官方分类、物品名和跳蚤报价数量筛选
+// @version      3.2.0
+// @description  支持 EFTarkov 新版排行的名称与报价数量筛选，保留旧版天梯增强功能
 // @author       Richard
 // @homepageURL  https://github.com/richardlzs/TampermonkeyScripts
 // @updateURL    https://raw.githubusercontent.com/richardlzs/TampermonkeyScripts/main/eftarkov/eft-price.user.js
 // @downloadURL  https://raw.githubusercontent.com/richardlzs/TampermonkeyScripts/main/eftarkov/eft-price.user.js
 // @match        https://www.eftarkov.com/news/web_210.html*
+// @match        https://www.eftarkov.com/ranking*
 // @grant        none
 // @run-at       document-start
 // ==/UserScript==
@@ -24,6 +25,13 @@
         Object.entries(MODE_CONFIG).map(([mode, config]) => [config.apiId, mode])
     );
     const FILTER_STORAGE_PREFIX = 'eftarkov-filter-';
+
+    // 新版服务端按模式和分类生成排行，使用独立入口，避免启动旧版 API/模式逻辑。
+    if (/^\/ranking\/?$/.test(new URL(location.href).pathname)) {
+        initializeRankingPage();
+        return;
+    }
+    if (new URL(location.href).pathname !== '/news/web_210.html') return;
 
     // 原站右下角模式按钮在首次访问时默认“赛季”，但价格页在尚无 currentMode 时默认 PvP。
     // 在 document-start 对齐这两个原站默认值，避免首屏原始档位与扩展档位串模式。
@@ -994,6 +1002,10 @@
     // 分类内部按原有规则组合；名称与报价数量再与分类条件取交集。
     function matchesFilters(item, filterState) {
         if (!matchesCategoryFilter(item, filterState)) return false;
+        return matchesNameAndOfferFilters(item, filterState);
+    }
+
+    function matchesNameAndOfferFilters(item, filterState) {
         const query = normalizeSearchText(filterState.searchQuery);
         if (query && !item.searchNames.some(name => name.includes(query))) return false;
         const { minOfferCount, maxOfferCount } = filterState;
@@ -1420,7 +1432,243 @@
     }
 
     // ---------------------------------------------------------------------
-    // 7. 启动
+    // 7. 新版 /ranking：直接筛选原站已加载的卡片，分类仍由原站导航控制。
+    // ---------------------------------------------------------------------
+
+    function resolveRankingMode(pageUrl, activeModeUrl) {
+        for (const href of [pageUrl, activeModeUrl]) {
+            if (!href) continue;
+            try {
+                const mode = new URL(href, pageUrl).searchParams.get('mode');
+                if (Object.hasOwn(MODE_CONFIG, mode)) return mode;
+            } catch (_) { /* 忽略无法解析的导航链接。 */ }
+        }
+        return 'pvp';
+    }
+
+    function loadRankingFilterState(mode) {
+        try {
+            // 首次使用新版时只继承旧版的名称/数量条件，不继承旧版分类限制。
+            const saved = JSON.parse(localStorage.getItem(`eftarkov-ranking-filter-${mode}`) ??
+                localStorage.getItem(`${FILTER_STORAGE_PREFIX}${mode}`));
+            const range = parseOfferCountRange(saved?.minOfferCount, saved?.maxOfferCount);
+            return {
+                searchQuery: typeof saved?.searchQuery === 'string' ? saved.searchQuery.trim() : '',
+                minOfferCount: range.valid ? range.min : null,
+                maxOfferCount: range.valid ? range.max : null
+            };
+        } catch (error) {
+            console.warn('[EFTarkov 扩展] 无法读取新版排行筛选设置:', error);
+            return { searchQuery: '', minOfferCount: null, maxOfferCount: null };
+        }
+    }
+
+    function saveRankingFilterState(state) {
+        try {
+            localStorage.setItem(`eftarkov-ranking-filter-${state.mode}`, JSON.stringify(state.filterState));
+        } catch (error) {
+            console.warn('[EFTarkov 扩展] 无法保存新版排行筛选设置:', error);
+        }
+    }
+
+    function parseRankingOfferCount(text) {
+        // 只读取明确的“报价数量”字段；缺失、未知、非法值均不能变成零。
+        const match = /^报价数量\s*[：:]\s*(\d{1,3}(?:,\d{3})+|\d+)\s*$/.exec(String(text ?? '').trim());
+        return match ? parseNonNegativeInteger(match[1].replaceAll(',', '')) : null;
+    }
+
+    function readRankingItem(element) {
+        const fullName = element.querySelector('.ranking-tooltip-source > b')?.textContent ||
+            element.querySelector('img')?.alt || element.getAttribute('aria-label')?.replace(/^查看/, '') || '';
+        const shortName = element.querySelector('.ranking-item-name')?.textContent || '';
+        const offerText = [...element.querySelectorAll('.ranking-tooltip-source > span')]
+            .map(span => span.textContent.trim()).find(text => /^报价数量\s*[：:]/.test(text));
+        return {
+            element,
+            searchNames: [normalizeSearchText(fullName), normalizeSearchText(shortName)],
+            offerCount: parseRankingOfferCount(offerText)
+        };
+    }
+
+    function initializeRankingPage() {
+        const panelId = 'tm-eft-ranking-filter';
+        let context = null;
+        let refreshTimer = null;
+        let searchTimer = null;
+
+        function applyRankingFilters(state) {
+            if (context !== state || !state.root.isConnected) return;
+            let visibleCount = 0;
+            const visibleByTier = new Map();
+            for (const item of state.items) {
+                const visible = matchesNameAndOfferFilters(item, state.filterState);
+                item.element.classList.toggle('tm-ranking-hidden', !visible);
+                if (visible) visibleCount += 1;
+                const tier = item.element.closest('.ranking-tier');
+                if (tier) {
+                    const counts = visibleByTier.get(tier) || { total: 0, visible: 0 };
+                    counts.total += 1;
+                    if (visible) counts.visible += 1;
+                    visibleByTier.set(tier, counts);
+                }
+            }
+            const filters = state.filterState;
+            const active = Boolean(filters.searchQuery) || filters.minOfferCount !== null || filters.maxOfferCount !== null;
+            for (const [tier, counts] of visibleByTier) {
+                const badge = tier.querySelector('h2 > span');
+                if (badge) {
+                    badge.dataset.tmRankingCount = '';
+                    const text = active ? `${counts.visible} / ${counts.total}` : String(counts.total);
+                    if (badge.textContent !== text) badge.textContent = text;
+                }
+                let empty = tier.querySelector('.tm-ranking-empty');
+                if (active && counts.visible === 0) {
+                    if (!empty) {
+                        empty = document.createElement('p');
+                        empty.className = 'tm-ranking-empty';
+                        empty.textContent = '当前筛选条件下无物品';
+                        tier.appendChild(empty);
+                    }
+                } else if (empty) empty.remove();
+            }
+            const status = state.panel.querySelector('[data-ranking-status]');
+            const text = `当前显示 ${visibleCount} / ${state.items.length} 件（当前模式、分类已加载的物品）`;
+            if (status.textContent !== text) status.textContent = text;
+        }
+
+        function createRankingPanel(state) {
+            const panel = document.createElement('section');
+            panel.id = panelId;
+            panel.setAttribute('aria-label', '物价筛选');
+            panel.innerHTML = `
+                <div class="tm-ranking-filter-head"><strong>名称与报价数量筛选</strong>
+                    <button type="button" data-ranking-reset>重置名称和数量</button></div>
+                <div class="tm-ranking-filter-inputs">
+                    <label class="tm-ranking-row"><span class="tm-ranking-label">物品名</span>
+                        <input id="tm-filter-name" type="search" placeholder="名称或简称包含关键词" autocomplete="off">
+                    </label>
+                    <div class="tm-ranking-row" role="group" aria-labelledby="tm-ranking-offer-label">
+                        <span id="tm-ranking-offer-label" class="tm-ranking-label">跳蚤报价数量</span>
+                        <div class="tm-ranking-range-inputs">
+                            <input id="tm-filter-offer-min" type="text" inputmode="numeric" aria-label="最小报价数量" aria-describedby="tm-ranking-range-help tm-ranking-error" placeholder="最小值" autocomplete="off">
+                            <span>～</span>
+                            <input id="tm-filter-offer-max" type="text" inputmode="numeric" aria-label="最大报价数量" aria-describedby="tm-ranking-range-help tm-ranking-error" placeholder="最大值" autocomplete="off">
+                            <small id="tm-ranking-range-help">留空不限，包含两端</small>
+                        </div>
+                    </div>
+                </div>
+                <div id="tm-ranking-error" role="status" aria-live="polite" hidden></div>
+                <div data-ranking-status aria-live="polite"></div>`;
+            const name = panel.querySelector('#tm-filter-name');
+            const min = panel.querySelector('#tm-filter-offer-min');
+            const max = panel.querySelector('#tm-filter-offer-max');
+            const error = panel.querySelector('#tm-ranking-error');
+            name.value = state.filterState.searchQuery;
+            min.value = state.offerRangeDraft.min;
+            max.value = state.offerRangeDraft.max;
+
+            function showRangeError() {
+                const message = state.offerRangeDraft.error;
+                error.textContent = message ? `${message} 已生效的数量范围保持不变。` : '';
+                error.hidden = !message;
+                min.setAttribute('aria-invalid', String(Boolean(message)));
+                max.setAttribute('aria-invalid', String(Boolean(message)));
+            }
+            name.addEventListener('input', () => {
+                state.filterState.searchQuery = name.value.trim();
+                saveRankingFilterState(state);
+                clearTimeout(searchTimer);
+                searchTimer = setTimeout(() => applyRankingFilters(state), 120);
+            });
+            const updateRange = () => {
+                const valid = updateOfferCountRange(state, min.value, max.value);
+                showRangeError();
+                if (valid) {
+                    saveRankingFilterState(state);
+                    applyRankingFilters(state);
+                }
+            };
+            min.addEventListener('input', updateRange);
+            max.addEventListener('input', updateRange);
+            panel.querySelector('[data-ranking-reset]').addEventListener('click', () => {
+                clearTimeout(searchTimer);
+                state.filterState = { searchQuery: '', minOfferCount: null, maxOfferCount: null };
+                state.offerRangeDraft = { min: '', max: '', error: '' };
+                name.value = min.value = max.value = '';
+                showRangeError();
+                saveRankingFilterState(state);
+                applyRankingFilters(state);
+            });
+            return panel;
+        }
+
+        function refreshRankingPage() {
+            const root = document.querySelector('.ranking-page');
+            if (!root) {
+                clearTimeout(searchTimer);
+                context = null;
+                return;
+            }
+            const mode = resolveRankingMode(location.href, root.querySelector('.ranking-modes a.is-active')?.href);
+            if (!context || context.root !== root || context.mode !== mode || !context.panel.isConnected) {
+                clearTimeout(searchTimer);
+                context?.panel.remove();
+                const filterState = loadRankingFilterState(mode);
+                context = {
+                    root, mode, filterState,
+                    offerRangeDraft: { min: String(filterState.minOfferCount ?? ''), max: String(filterState.maxOfferCount ?? ''), error: '' }
+                };
+                context.panel = createRankingPanel(context);
+                const categories = root.querySelector('.ranking-categories');
+                if (categories) categories.after(context.panel);
+                else root.prepend(context.panel);
+            }
+            context.items = [...root.querySelectorAll('.ranking-item')].map(readRankingItem);
+            applyRankingFilters(context);
+        }
+
+        function start() {
+            const style = document.createElement('style');
+            style.textContent = `
+                .ranking-item.tm-ranking-hidden { display: none !important; }
+                .tm-ranking-empty { padding: 12px; opacity: .7; }
+                #${panelId} { margin: 16px 0; padding: 16px; border: 1px solid #8886; border-radius: 8px; color: inherit; }
+                #${panelId} .tm-ranking-filter-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+                #${panelId} .tm-ranking-filter-inputs { display: grid; gap: 12px; }
+                #${panelId} .tm-ranking-row { display: grid; grid-template-columns: 6em minmax(0, 1fr); align-items: center; gap: 12px; }
+                #${panelId} .tm-ranking-label { white-space: nowrap; }
+                #${panelId} .tm-ranking-range-inputs { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; }
+                #${panelId} input, #${panelId} button { color: inherit; background: transparent; border: 1px solid #8888; border-radius: 4px; padding: 6px 8px; font: inherit; box-sizing: border-box; }
+                #${panelId} button { cursor: pointer; }
+                #${panelId} input[type=search] { width: 100%; min-width: 0; }
+                #${panelId} .tm-ranking-range-inputs input { width: 110px; }
+                #${panelId} small { opacity: .7; }
+                #${panelId} [data-ranking-status] { margin-top: 12px; font-size: 13px; }
+                #tm-ranking-error { color: #d7503d; margin-top: 8px; }
+                #${panelId} input[aria-invalid=true] { border-color: #d7503d; }
+            `;
+            (document.head || document.documentElement).appendChild(style);
+            refreshRankingPage();
+            // 兼容原站局部导航及卡片更新；忽略自己的提示/计数变动，避免观察器循环。
+            new MutationObserver(records => {
+                const root = document.querySelector('.ranking-page');
+                const changedPage = root !== (context?.root ?? null);
+                const changedItems = records.some(record => {
+                    const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+                    return root?.contains(target) && !target.closest(`#${panelId}, .tm-ranking-empty, [data-tm-ranking-count]`);
+                });
+                if (!changedPage && !changedItems) return;
+                clearTimeout(refreshTimer);
+                refreshTimer = setTimeout(refreshRankingPage, 80);
+            }).observe(document.body, { childList: true, subtree: true, characterData: true });
+        }
+
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+        else start();
+    }
+
+    // ---------------------------------------------------------------------
+    // 8. 旧版启动
     // ---------------------------------------------------------------------
 
     function initializeDom() {
