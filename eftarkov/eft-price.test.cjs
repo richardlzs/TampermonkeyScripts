@@ -24,7 +24,7 @@ vm.runInNewContext(instrumented, {
     window,
     document: { readyState: 'loading', addEventListener() {} },
     localStorage,
-    location: { href: 'https://www.eftarkov.com/news/web_210.html' },
+    location: { href: 'https://ce.eftarkov.com/news/web_210.html' },
     URL,
     AbortController,
     setTimeout,

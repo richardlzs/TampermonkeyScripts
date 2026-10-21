@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         EFTarkov 物价天梯增强 + 官方分类筛选
 // @namespace    https://www.eftarkov.com/
-// @version      3.2.0
+// @version      3.2.1
 // @description  支持 EFTarkov 新版排行的名称与报价数量筛选，保留旧版天梯增强功能
 // @author       Richard
 // @homepageURL  https://github.com/richardlzs/TampermonkeyScripts
 // @updateURL    https://raw.githubusercontent.com/richardlzs/TampermonkeyScripts/main/eftarkov/eft-price.user.js
 // @downloadURL  https://raw.githubusercontent.com/richardlzs/TampermonkeyScripts/main/eftarkov/eft-price.user.js
 // @match        https://www.eftarkov.com/news/web_210.html*
+// @match        https://ce.eftarkov.com/news/web_210.html*
 // @match        https://www.eftarkov.com/ranking*
 // @grant        none
 // @run-at       document-start

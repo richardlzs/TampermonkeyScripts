@@ -1,6 +1,6 @@
 # EFTarkov 物价天梯增强
 
-适用于 [EFTarkov 新版物价天梯](https://www.eftarkov.com/ranking) 的 Tampermonkey 脚本，支持 PvE、PvP 和 PvP Season（原站显示为“赛季”），并保留旧版 `news/web_210.html` 页面支持。
+适用于 [EFTarkov 新版物价天梯](https://www.eftarkov.com/ranking) 的 Tampermonkey 脚本，支持 PvE、PvP 和 PvP Season（原站显示为“赛季”），并支持迁移到 [ce.eftarkov.com 的旧版天梯](https://ce.eftarkov.com/news/web_210.html)，同时保留旧地址匹配。
 
 ## 安装
 
@@ -25,6 +25,8 @@
 筛选范围仅限当前页面已经展示的数据，不额外请求其他分类、逐件查询物品接口或新增低价档位。新版展示的是原站“单价”排行，旧版的单格价值计算不用于新版。脚本不启动旧版 `boss.php` 请求，也不修改旧版 `localStorage.currentMode`。
 
 ## 旧版天梯（news/web_210.html）
+
+旧版天梯现位于 `https://ce.eftarkov.com/news/web_210.html`。域名不同，原来保存在 `www.eftarkov.com` 的模式和筛选设置不会自动迁移到 `ce.eftarkov.com`，可在新地址重新设置。
 
 - 沿用原站“跳蚤价格与最高商人收购价取较高值，再除以格子数”的算法。
 - 在原站的 50,000 ₽/格以上五档之后增加 40,000、30,000、20,000、10,000 ₽/格起始的四档；50,000 ₽/格及以上物品仍由原站渲染。
@@ -53,5 +55,6 @@
 
 ## 版本记录
 
+- 3.2.1：增加旧版天梯迁移域名 `ce.eftarkov.com` 的匹配，保留 `www.eftarkov.com/ranking` 支持。
 - 3.2.0：适配新版 `/ranking`，从原站卡片读取名称和报价数量，复用原站分类导航，并为新版单独保存筛选条件。
 - 3.1.0：新增物品名搜索、跳蚤报价数量范围、组合筛选和重置所有筛选，支持按模式保存并兼容旧设置。
