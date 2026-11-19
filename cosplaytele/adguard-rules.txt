@@ -1,0 +1,11 @@
+! Cosplaytele click/popunder fix - updated 2026-11-19
+! Block the current external popunder script and its inline loader.
+||zesty-career.com^$script,domain=cosplaytele.com
+cosplaytele.com#%#//scriptlet('abort-current-inline-script', 'Document.prototype.createElement', 's.settings = ulgt')
+
+! October variant, retained for pages that still serve it.
+cosplaytele.com#%#//scriptlet('abort-current-inline-script', 'EventTarget.prototype.addEventListener', 'load1spAndCustomPops')
+||sore-war.com^$domain=cosplaytele.com
+
+! Optional: preserve the original Gofile download URL (remove this line to keep ouo.io).
+||cdn.ouo.io/js/full-page-script.js$script,domain=cosplaytele.com
