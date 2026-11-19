@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         IPinfo AS 全部 IP 段导出
 // @namespace    https://ipinfo.io/
-// @version      1.0.0
+// @version      1.0.1
 // @description  在 AS 页面的 IP Ranges 标题右侧添加按钮，自动展开并合并导出全部 IPv4、IPv6 网段为单列 CSV
 // @author       Richard
 // @homepageURL  https://github.com/richardlzs/TampermonkeyScripts
@@ -17,6 +17,7 @@
 
     const BUTTON_ID = 'tm-ipinfo-export-ranges';
     const STYLE_ID = 'tm-ipinfo-export-ranges-style';
+    const SECTION_SELECTOR = 'section:is(#ip-ranges, #ranges)';
     const TIMEOUT_MS = 20000;
     const BUTTON_LABEL = '导出全部IP段';
 
@@ -202,7 +203,7 @@
 
     function mountButton() {
         if (!getAsn() || document.getElementById(BUTTON_ID)) return;
-        const section = document.querySelector('section#ranges');
+        const section = document.querySelector(SECTION_SELECTOR);
         const heading = section?.querySelector('h2');
         if (!heading || !/^IP Ranges$/i.test(heading.textContent.trim())) return;
 
@@ -218,8 +219,7 @@
         status.setAttribute('role', 'status');
         status.setAttribute('aria-live', 'polite');
         controls.append(button);
-        heading.insertAdjacentElement('afterend', controls);
-        heading.parentElement.appendChild(status);
+        heading.parentElement.append(controls, status);
         button.addEventListener('click', () => {
             if (!button.disabled) void exportAll(section, button, status);
         });
@@ -228,9 +228,9 @@
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = `
-        #ranges h2 { flex-shrink: 0; }
-        #ranges h2:has(+ .tm-ipinfo-export-controls) { margin-right: 0; }
-        #ranges div:has(> .tm-ipinfo-export-controls) { flex-wrap: wrap; }
+        ${SECTION_SELECTOR} h2 { flex-shrink: 0; }
+        ${SECTION_SELECTOR} div:has(> .tm-ipinfo-export-controls) { flex-wrap: wrap; }
+        ${SECTION_SELECTOR} div:has(> .tm-ipinfo-export-controls) > h2 { margin-right: 0; }
         .tm-ipinfo-export-controls { display: flex; align-items: center; margin-left: auto; }
         #${BUTTON_ID} { background: #2563eb; color: #fff; border: 0; border-radius: 6px;
             padding: 7px 12px; font-size: 13px; font-weight: 600; line-height: 1.5;
