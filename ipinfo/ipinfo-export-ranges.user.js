@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         IPinfo AS 全部 IP 段导出
 // @namespace    https://ipinfo.io/
-// @version      1.0.1
-// @description  在 AS 页面的 IP Ranges 标题右侧添加按钮，自动展开并合并导出全部 IPv4、IPv6 网段为单列 CSV
+// @version      1.1.0
+// @description  在 IPinfo AS 页导出 RIPEstat 最新 BGP 快照中的 IPv4、IPv6 前缀为单列 CSV
 // @author       Richard
 // @homepageURL  https://github.com/richardlzs/TampermonkeyScripts
 // @match        https://ipinfo.io/AS*
@@ -28,100 +28,43 @@
     // @match 的通配符也会匹配网段详情页，实际只在 AS 首页运行。
     if (!getAsn() || document.getElementById(STYLE_ID)) return;
 
-    function findButton(section, pattern) {
-        return Array.from(section.querySelectorAll('button')).find(button =>
-            pattern.test(button.textContent.trim())
-        );
-    }
-
-    function familyButtons(section) {
-        return Array.from(section.querySelectorAll('button')).filter(button =>
-            /^IPv[46]$/.test(button.textContent.trim())
-        );
-    }
-
-    function activeFamily(section) {
-        return familyButtons(section).find(button =>
-            button.getAttribute('aria-pressed') === 'true'
-        )?.textContent.trim() || null;
-    }
-
-    function readRanges(section) {
-        const ranges = new Set();
-        // 只读 IP Ranges 表格首列，避免混入 WHOIS、Peers 或公司名称中的地址。
-        for (const cell of section.querySelectorAll('tbody tr td:first-child')) {
-            const text = (cell.querySelector('a') || cell).textContent.trim();
-            const match = text.match(/^((?:\d{1,3}\.){3}\d{1,3}|[\da-f]*:[\da-f:]+)\/(\d{1,3})$/i);
-            if (!match) continue;
-            const ipv6 = match[1].includes(':');
-            if (Number(match[2]) > (ipv6 ? 128 : 32)) continue;
-            if (!ipv6 && match[1].split('.').some(part => Number(part) > 255)) continue;
-            ranges.add(text.toLowerCase());
+    function isCidr(value, family) {
+        const match = typeof value === 'string' && value.match(/^([\da-f:.]+)\/(\d{1,3})$/i);
+        if (!match) return false;
+        const [, address, length] = match;
+        if (family === 'v6') {
+            return Number(length) <= 128 && URL.canParse(`http://[${address}]/`);
         }
-        return Array.from(ranges);
+        return Number(length) <= 32 && /^(?:\d{1,3}\.){3}\d{1,3}$/.test(address) &&
+            address.split('.').every(part => Number(part) <= 255);
     }
 
-    function isLoading(section) {
-        return Boolean(section.querySelector('[aria-busy="true"]')) ||
-            /\bloading\b/i.test(section.textContent);
-    }
-
-    function assertCurrentPage(section, asn) {
-        if (!section.isConnected || getAsn() !== asn) {
-            throw new Error('页面已切换，请在当前 AS 页面重新导出。');
+    function readFamily(data, family) {
+        const ranges = data.prefixes?.[family]?.originating;
+        const count = data.counts?.[family]?.originating;
+        if (!Array.isArray(ranges) || ranges.length !== count ||
+            !ranges.every(range => isCidr(range, family))) {
+            throw new Error(`RIPEstat 的 IP${family} 列表不完整或格式异常，未导出文件。`);
         }
+        return ranges.map(range => range.toLowerCase());
     }
 
-    async function waitFor(section, asn, predicate, message) {
-        const deadline = Date.now() + TIMEOUT_MS;
-        while (true) {
-            assertCurrentPage(section, asn);
-            if (predicate()) return;
-            if (Date.now() >= deadline) throw new Error(message);
-            await new Promise(resolve => setTimeout(resolve, 100));
+    async function fetchRanges(asn) {
+        // 最新 RIS 快照。types=o 只取当前 ASN 发起的路由，list_prefixes=true 返回完整列表。
+        const query = new URLSearchParams({ resource: asn, list_prefixes: 'true', types: 'o' });
+        const response = await fetch(`https://stat.ripe.net/data/ris-prefixes/data.json?${query}`, {
+            credentials: 'omit',
+            referrerPolicy: 'no-referrer',
+            signal: AbortSignal.timeout(TIMEOUT_MS)
+        });
+        if (!response.ok) throw new Error(`RIPEstat 请求失败（HTTP ${response.status}），未导出文件。`);
+
+        const { status, data } = await response.json();
+        if (status !== 'ok' || String(data?.resource) !== String(Number(asn.slice(2)))) {
+            throw new Error('RIPEstat 未返回当前 AS 的有效数据，未导出文件。');
         }
-    }
 
-    async function waitUntilReady(section, asn) {
-        await waitFor(section, asn, () => !isLoading(section), 'IP Ranges 加载超时，未导出文件。');
-    }
-
-    async function selectFamily(section, asn, family) {
-        const button = familyButtons(section).find(item => item.textContent.trim() === family);
-        if (!button) throw new Error(`未找到 ${family} 切换按钮，未导出文件。`);
-        if (activeFamily(section) !== family) {
-            if (button.disabled) throw new Error(`${family} 切换按钮不可用，未导出文件。`);
-            button.click();
-            await waitFor(section, asn, () => activeFamily(section) === family,
-                `切换 ${family} 超时，未导出文件。`);
-        }
-        await waitUntilReady(section, asn);
-    }
-
-    async function expandAll(section, asn, onProgress = () => {}) {
-        const ranges = new Set();
-        while (true) {
-            assertCurrentPage(section, asn);
-            await waitUntilReady(section, asn);
-            readRanges(section).forEach(range => ranges.add(range));
-            onProgress(ranges.size);
-
-            const more = findButton(section, /^show more(?:\s+ip ranges)?$/i);
-            if (!more) return ranges;
-
-            await waitFor(section, asn, () => !more.disabled && !isLoading(section),
-                'Show more IP Ranges 不可用，未导出文件。');
-            const before = readRanges(section).join('\n');
-            more.click();
-            // 同时支持一次性展开和多次追加；按钮无响应时必须报错，不能下载前十条。
-            await waitFor(section, asn, () => !isLoading(section) &&
-                readRanges(section).join('\n') !== before,
-            'Show more IP Ranges 未加载出更多网段，未导出文件。');
-            if (findButton(section, /^show more(?:\s+ip ranges)?$/i) &&
-                readRanges(section).every(range => ranges.has(range))) {
-                throw new Error('Show more IP Ranges 未返回新网段，未导出文件。');
-            }
-        }
+        return new Set([...readFamily(data, 'v4'), ...readFamily(data, 'v6')]);
     }
 
     function downloadCsv(asn, ranges) {
@@ -141,61 +84,32 @@
 
     async function exportAll(section, button, status) {
         const asn = getAsn();
-        const originalFamily = activeFamily(section);
-        const originallyExpanded = Boolean(findButton(section, /^show less$/i));
+        if (!asn) return;
+
         button.disabled = true;
         button.textContent = '正在导出…';
         status.dataset.error = 'false';
-        status.textContent = '正在读取全部 IP 段…';
+        status.textContent = '正在读取 RIPEstat BGP 快照…';
 
-        // 导出期间阻止手动切换筛选或折叠；脚本触发的 click 不受影响。
-        const blockManualChanges = event => {
-            if (event.isTrusted && event.target.closest('button')) {
-                event.preventDefault();
-                event.stopImmediatePropagation();
-            }
-        };
-        section.addEventListener('click', blockManualChanges, true);
         try {
-            assertCurrentPage(section, asn);
-            if (!originalFamily && familyButtons(section).length) {
-                throw new Error('无法确认当前 IP 类型，请等待页面加载后重试。');
+            const ranges = await fetchRanges(asn);
+            if (!section.isConnected || getAsn() !== asn) {
+                throw new Error('页面已切换，请在当前 AS 页面重新导出。');
             }
-            const families = familyButtons(section).map(item => item.textContent.trim());
-            const allRanges = new Set();
-            for (const family of families.length ? families : [null]) {
-                if (family) await selectFamily(section, asn, family);
-                const ranges = await expandAll(section, asn, count => {
-                    status.textContent = `正在读取 ${family || 'IP'}：${count} 段…`;
-                });
-                // 空列表可以是没有 IPv6；结构变化或错误页面则不能默认为空列表。
-                if (!ranges.size && !/\bno\b[^.\n]*(?:ranges|netblocks|prefixes)\b/i.test(section.textContent)) {
-                    throw new Error(`${family || 'IP'} 列表未就绪或结构已变化，未导出文件。`);
-                }
-                ranges.forEach(range => allRanges.add(range));
-            }
-            if (!allRanges.size) throw new Error('此 AS 没有可导出的 IP 段。');
-            assertCurrentPage(section, asn);
-            downloadCsv(asn, allRanges);
-            status.textContent = `已导出 ${allRanges.size} 个 IP 段`;
+            if (!ranges.size) throw new Error('RIPEstat 最新快照中没有此 AS 发起的路由前缀。');
+            downloadCsv(asn, ranges);
+            status.textContent = `已导出 ${ranges.size} 个 IP 段（RIPEstat）`;
         } catch (error) {
             console.error('[IPinfo IP 段导出]', error);
             status.dataset.error = 'true';
-            status.textContent = error.message || '导出失败，请重试。';
-        } finally {
-            try {
-                if (section.isConnected && getAsn() === asn && originalFamily) {
-                    await selectFamily(section, asn, originalFamily);
-                    if (originallyExpanded) {
-                        await expandAll(section, asn);
-                    } else {
-                        findButton(section, /^show less$/i)?.click();
-                    }
-                }
-            } catch (error) {
-                console.warn('[IPinfo IP 段导出] 恢复页面筛选失败', error);
+            if (error.name === 'TimeoutError') {
+                status.textContent = 'RIPEstat 请求超时，未导出文件。';
+            } else if (error.name === 'TypeError' || error.name === 'SyntaxError') {
+                status.textContent = '无法读取 RIPEstat 数据，请检查网络后重试。';
+            } else {
+                status.textContent = error.message || '导出失败，请重试。';
             }
-            section.removeEventListener('click', blockManualChanges, true);
+        } finally {
             button.disabled = false;
             button.textContent = BUTTON_LABEL;
         }
@@ -213,7 +127,7 @@
         button.id = BUTTON_ID;
         button.type = 'button';
         button.textContent = BUTTON_LABEL;
-        button.title = '自动展开并导出此 AS 的全部 IPv4 和 IPv6 网段';
+        button.title = '导出 RIPEstat 最新 BGP 快照中此 AS 发起的 IPv4 和 IPv6 前缀';
         const status = document.createElement('span');
         status.className = 'tm-ipinfo-export-status';
         status.setAttribute('role', 'status');
